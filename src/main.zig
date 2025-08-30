@@ -10,9 +10,6 @@ fn print(s: []const u8) void {
 fn enableUtf8() void {
     if (builtin.target.os.tag == .windows) {
         // Use Win32 calls to switch console to UTF-8 and enable VT processing
-        const c = @cImport({
-            @cInclude("windows.h");
-        });
 
         // Set input/output code page to UTF-8
         // UINT SetConsoleOutputCP(UINT wCodePageID);
@@ -28,11 +25,11 @@ fn enableUtf8() void {
         }
     } else {
         // Ask libc to use the environment locale (so printf/term use UTF-8)
-        const c = @cImport({
+        const c2 = @cImport({
             @cInclude("locale.h");
         });
         // setlocale returns a C string, ignore return here
-        _ = c.setlocale(c.LC_ALL, "");
+        _ = c2.setlocale(c2.LC_ALL, "");
     }
 }
 
@@ -66,6 +63,191 @@ const WHITE = CSI ++ "37m";
 const BG_RED = CSI ++ "41m";
 const BG_GREEN = CSI ++ "42m";
 const BG_BLUE = CSI ++ "44m";
+
+const os = std.os;
+
+const TerminalMode = struct {
+    const Self = @This();
+    // In Zig, termios refers to the functionality for controlling terminal interface attributes, similar to the termios API found in C and POSIX systems. This is crucial for low-level terminal manipulation, such as setting raw mode for reading individual key presses without requiring an Enter key press, or controlling input/output buffering and echoing.
+
+    original_termios: if (builtin.os.tag == .linux or builtin.os.tag == .macos) std.posix.termios else void,
+
+    win_in_handle: if (builtin.os.tag == .windows) c.HANDLE else void,
+    win_orig_in_mode: if (builtin.os.tag == .windows) c.DWORD else void,
+    win_out_handle: if (builtin.os.tag == .windows) c.HANDLE else void,
+    win_orig_out_mode: if (builtin.os.tag == .windows) c.DWORD else void,
+
+    pub fn Init() !Self {
+        var mode = Self{
+            .original_termios = undefined,
+            .win_in_handle = undefined,
+            .win_orig_in_mode = undefined,
+            .win_out_handle = undefined,
+            .win_orig_out_mode = undefined,
+        };
+        if (builtin.os.tag == .linux or builtin.os.tag == .macos) {
+            // Get current terminal attributes
+            mode.original_termios = try os.tcgetattr(std.os.STDIN_FILENO);
+
+            // Create new attributes for raw mode
+            var raw = mode.original_termios;
+
+            // Disable canonical mode (line buffering)
+            raw.lflag &= ~@as(u32, os.system.ICANON);
+            // Disable echo
+            raw.lflag &= ~@as(u32, os.system.ECHO);
+            // Disable Ctrl+C and Ctrl+Z signals
+            raw.lflag &= ~@as(u32, os.system.ISIG);
+            // Disable processing of input characters
+            raw.iflag &= ~@as(u32, os.system.IXON);
+            raw.iflag &= ~@as(u32, os.system.ICRNL);
+            // Disable output processing
+            raw.oflag &= ~@as(u32, os.system.OPOST);
+
+            // Set minimum number of characters for non-canonical read
+            raw.cc[os.system.VMIN] = 0; // Don't wait for characters
+            raw.cc[os.system.VTIME] = 1; // Wait 100ms max
+
+            // Apply new attributes
+            try os.tcsetattr(std.os.STDIN_FILENO, os.system.TCSA.FLUSH, raw);
+        } else if (builtin.os.tag == .windows) {
+
+            // Windows console handling via Win32 API
+            const hIn = c.GetStdHandle(c.STD_INPUT_HANDLE);
+            const hOut = c.GetStdHandle(c.STD_OUTPUT_HANDLE);
+
+            if (hIn == c.INVALID_HANDLE_VALUE or hOut == c.INVALID_HANDLE_VALUE) {
+                return error.InvalidStdHandle;
+            }
+
+            var inMode: c.DWORD = 0;
+            if (c.GetConsoleMode(hIn, &inMode) == 0) {
+                return error.GetConsoleModeFailed;
+            }
+
+            // Save original input mode
+            mode.win_in_handle = hIn;
+            mode.win_orig_in_mode = inMode;
+
+            // turn off line input, echo, processed input (Ctrl-C handling)
+            // boolean or:src\main.zig:133:65: error: expected type 'bool', found 'c_int'
+            //             const newInMode: c.DWORD = inMode & ~(@as(c.DWORD, c.ENABLE_LINE_INPUT or c.ENABLE_ECHO_INPUT or c.ENABLE_PROCESSED_INPUT));
+            //                                                                ~^~~~~~~~~~~~~~~~~~
+            // referenced by:
+            //     main: src\main.zig:223:46
+            //     main: C:\ProgramData\chocolatey\lib\zig\tools\zig-windows-x86_64-0.14.0\lib\std\start.zig:656:37
+            //     3 reference(s) hidden; use '-freference-trace=5' to see all references
+
+            // bitwise or |
+            const newInMode: c.DWORD = inMode & ~(@as(c.DWORD, c.ENABLE_LINE_INPUT | c.ENABLE_ECHO_INPUT | c.ENABLE_PROCESSED_INPUT));
+            if (c.SetConsoleMode(hIn, newInMode) == 0) {
+                return error.SetConsoleModeFailed;
+            }
+
+            // Output: enable virtual terminal processing so ANSI escapes work
+            var outMode: c.DWORD = 0;
+            if (c.GetConsoleMode(hOut, &outMode) == 0) {
+                // Try to restore input on failure before returning
+                _ = c.SetConsoleMode(hIn, mode.win_orig_in_mode);
+                return error.GetConsoleModeFailed;
+            }
+            mode.win_out_handle = hOut;
+            mode.win_orig_out_mode = outMode;
+
+            const vt_flag: c.DWORD = @as(c.DWORD, c.ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+            if ((outMode & vt_flag) == 0) {
+                if (c.SetConsoleMode(hOut, outMode | vt_flag) == 0) {
+                    // restore input before failing
+                    _ = c.SetConsoleMode(hIn, mode.win_orig_in_mode);
+                    return error.SetConsoleModeFailed;
+                }
+            }
+
+            return mode;
+        }
+        // default for other oses
+        return mode;
+    }
+
+    pub fn deinit(self: *Self) void {
+        if (builtin.os.tag == .linux or builtin.os.tag == .macos) {
+            // Restore original terminal settings
+            os.tcsetattr(std.os.STDIN_FILENO, os.system.TCSA.FLUSH, self.original_termios) catch {};
+        } else if (builtin.os.tag == .windows) {
+            // Restore windows console modes (best-effort)
+            if (self.win_in_handle != c.INVALID_HANDLE_VALUE) {
+                _ = c.SetConsoleMode(self.win_in_handle, self.win_orig_in_mode);
+            }
+            if (self.win_out_handle != c.INVALID_HANDLE_VALUE) {
+                _ = c.SetConsoleMode(self.win_out_handle, self.win_orig_out_mode);
+            }
+        }
+    }
+};
+
+// key definitions
+
+const Key = enum {
+    Unknown,
+    Escape,
+    Enter,
+    Space,
+    Backspace,
+    Tab,
+    ArrowUp,
+    ArrowDown,
+    ArrowLeft,
+    ArrowRight,
+    Character,
+
+    pub fn fromByte(byte: u8) Key {
+        return switch (byte) {
+            27 => .Escape,
+            13, 10 => .Enter,
+            32 => .Space,
+            127, 8 => .Backspace,
+            9 => .Tab,
+            else => if (byte >= 32 and byte <= 126) .Character else .Unknown,
+        };
+    }
+};
+
+// input
+
+const InputReader = struct {
+    const Self = @This();
+
+    pub fn readKey() !?struct { key: Key, char: u8 } {
+        // const stdout = std.io.getStdOut().writer();
+        const stdin = std.io.getStdIn().reader();
+        var buffer: [8]u8 = undefined;
+
+        const bytes_read = stdin.read(&buffer) catch |err| switch (err) {
+            error.WouldBlock => return null, // No input available
+            else => return err,
+        };
+
+        if (bytes_read == 0) return null;
+
+        const first_byte = buffer[0];
+
+        // Handle escape sequences (arrow keys, function keys, etc.)
+        if (first_byte == 27 and bytes_read > 1) {
+            if (buffer[1] == '[' and bytes_read >= 3) {
+                return switch (buffer[2]) {
+                    'A' => .{ .key = .ArrowUp, .char = 0 },
+                    'B' => .{ .key = .ArrowDown, .char = 0 },
+                    'C' => .{ .key = .ArrowRight, .char = 0 },
+                    'D' => .{ .key = .ArrowLeft, .char = 0 },
+                    else => .{ .key = .Unknown, .char = 0 },
+                };
+            }
+            return .{ .key = .Escape, .char = first_byte };
+        }
+
+        return .{ .key = Key.fromByte(first_byte), .char = first_byte };
+    }
+};
 
 const Color = struct {
     const Self = @This();
@@ -111,10 +293,13 @@ fn setCursor(row: u16, col: u16) void {
 }
 
 pub fn main() !void {
+    var terminal_mode = try TerminalMode.Init();
+    defer terminal_mode.deinit();
+    enableUtf8();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     var allocator: std.mem.Allocator = gpa.allocator();
-    // enableUtf8();
+
     print(CLEAR_SCREEN ++ CURSOR_HOME ++ HIDE_CURSOR);
 
     setCursor(2, 10);
@@ -299,42 +484,128 @@ pub fn main() !void {
     // // print(Color.colorRGB(allocator, 139, 69, 19) ++ "Mountain" ++ RESET);
     // d_print("{s}{s}{s}", .{ Color.colorRGB(allocator, 139, 69, 19), "Mountain", RESET });
 
-    setCursor(26, 1);
-    print(SHOW_CURSOR);
+    // setCursor(26, 1);
+    print(CLEAR_SCREEN ++ CURSOR_HOME ++ HIDE_CURSOR);
+    // Simple player position
+    var player_x: i16 = 10;
+    var player_y: i16 = 10;
+
+    // Game world
+    const world_width = 20;
+    const world_height = 10;
+
+    setCursor(1, 1);
+    print("Raw Input Demo - Use arrow keys to move, ESC to quit");
+    setCursor(2, 1);
+    print("Press any key to see key codes");
+
+    var running = true;
+    while (running) {
+        drawWorld(world_width, world_height, player_x, player_y);
+        // Show current position
+        setCursor(world_height + 5, 1);
+        d_print("Player position: ({}, {})", .{ player_x, player_y });
+
+        if (try InputReader.readKey()) |input| {
+            setCursor(world_height + 6, 1);
+            d_print("Last key: {} (char: {})", .{ input.key, input.char });
+
+            switch (input.key) {
+                .Escape => running = false,
+                .ArrowUp => {
+                    if (player_y > 0) player_y -= 1;
+                },
+                .ArrowDown => {
+                    if (player_y < world_height - 1) player_y += 1;
+                },
+                .ArrowLeft => {
+                    if (player_x > 0) player_x -= 1;
+                },
+                .ArrowRight => {
+                    if (player_x < world_width - 1) player_x += 1;
+                },
+                .Character => {
+                    // Handle WASD movement as well
+                    switch (input.char) {
+                        'w', 'W' => {
+                            if (player_y > 0) player_y -= 1;
+                        },
+                        's', 'S' => {
+                            if (player_y < world_height - 1) player_y += 1;
+                        },
+                        'a', 'A' => {
+                            if (player_x > 0) player_x -= 1;
+                        },
+                        'd', 'D' => {
+                            if (player_x < world_width - 1) player_x += 1;
+                        },
+                        'q', 'Q' => running = false,
+                        else => {},
+                    }
+                },
+                else => {},
+            }
+        }
+        std.time.sleep(16_000_000); // ~60 FPS
+    }
+    print(SHOW_CURSOR ++ RESET);
+    setCursor(world_height + 8, 1);
+    print("Thanks for playing!");
+    try entities.demonstrateAllocators();
+    try entities.demonstrateErrorHandling();
+    try components.demoComponents();
+    // try comptimedemo.demoComptime();
+}
+
+fn drawWorld(width: i16, height: i16, player_x: i16, player_y: i16) void {
+    var y: i16 = 0;
+    while (y < height) : (y += 1) {
+        setCursor(@intCast(y + 4), 5);
+        var x: i16 = 0;
+        while (x < width) : (x += 1) {
+            if (x == player_x and y == player_y) {
+                print(YELLOW ++ "@" ++ RESET);
+            } else if (y == 0 or y == height - 1 or x == 0 or x == width - 1) {
+                print(GREEN ++ "#" ++ RESET);
+            } else {
+                print(".");
+            }
+        }
+    }
 }
 
 // HSV to RGB conversion for rainbow effects
 fn hsvToRgb(h: f32, s: f32, v: f32) [3]u8 {
-    const c = v * s;
-    const x = c * (1 - @abs(@mod(h / 60.0, 2.0) - 1));
-    const m = v - c;
+    const c1 = v * s;
+    const x = c1 * (1 - @abs(@mod(h / 60.0, 2.0) - 1));
+    const m = v - c1;
 
     var r: f32 = 0;
     var g: f32 = 0;
     var b: f32 = 0;
 
     if (h < 60) {
-        r = c;
+        r = c1;
         g = x;
         b = 0;
     } else if (h < 120) {
         r = x;
-        g = c;
+        g = c1;
         b = 0;
     } else if (h < 180) {
         r = 0;
-        g = c;
+        g = c1;
         b = x;
     } else if (h < 240) {
         r = 0;
         g = x;
-        b = c;
+        b = c1;
     } else if (h < 300) {
         r = x;
         g = 0;
-        b = c;
+        b = c1;
     } else {
-        r = c;
+        r = c1;
         g = 0;
         b = x;
     }
@@ -348,7 +619,15 @@ fn hsvToRgb(h: f32, s: f32, v: f32) [3]u8 {
 
 const std = @import("std");
 const builtin = @import("builtin");
+const c = @cImport({
+    @cInclude("windows.h");
+});
 
+// TODO: move to game.zig
+
+const entities = @import("./entities.zig");
+const components = @import("./components.zig");
+const comptimedemo = @import("./comptime.zig");
 // ANSI Constants: We define escape sequences as compile-time string constants. The CSI (Control Sequence Introducer) \x1B[ is the start of most ANSI commands.
 // Cursor Control: setCursor(row, col) uses the H command to position the cursor anywhere on screen. This is crucial for building our game world.
 // Color System: We're using 4-bit colors (the original 16-color terminal palette). Each color has a foreground (31m for red) and background variant (41m for red background).

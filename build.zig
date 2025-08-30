@@ -28,6 +28,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const entity_mod = b.createModule(.{
+        .root_source_file = b.path("src/entities.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // We will also create a module for our other entry point, 'main.zig'.
     const exe_mod = b.createModule(.{
         // `root_source_file` is the Zig "entry point" of the module. If a module
@@ -43,6 +49,7 @@ pub fn build(b: *std.Build) void {
     // This is what allows Zig source code to use `@import("foo")` where 'foo' is not a
     // file path. In this case, we set up `exe_mod` to import `lib_mod`.
     exe_mod.addImport("asciiengine_lib", lib_mod);
+    exe_mod.addImport("entities_lib", entity_mod);
 
     // Now, we will create a static library based on the module we created above.
     // This creates a `std.Build.Step.Compile`, which is the build step responsible
@@ -53,10 +60,16 @@ pub fn build(b: *std.Build) void {
         .root_module = lib_mod,
     });
 
+    const entities = b.addLibrary(.{
+        .linkage = .static,
+        .name = "entities",
+        .root_module = entity_mod,
+    });
     // This declares intent for the library to be installed into the standard
     // location when the user invokes the "install" step (the default step when
     // running `zig build`).
     b.installArtifact(lib);
+    b.installArtifact(entities);
 
     // This creates another `std.Build.Step.Compile`, but this one builds an executable
     // rather than a static library.

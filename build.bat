@@ -1,0 +1,1 @@
+ zig run -I . .\src\main.zig  -lc
