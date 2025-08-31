@@ -555,6 +555,7 @@ pub fn main() !void {
     try entities.demonstrateErrorHandling();
     try components.demoComponents();
     // try comptimedemo.demoComptime();
+    try naiverender.demoNaiverender();
 }
 
 fn drawWorld(width: i16, height: i16, player_x: i16, player_y: i16) void {
@@ -628,6 +629,7 @@ const c = @cImport({
 const entities = @import("./entities.zig");
 const components = @import("./components.zig");
 const comptimedemo = @import("./comptime.zig");
+const naiverender = @import("./naiverendering.zig");
 // ANSI Constants: We define escape sequences as compile-time string constants. The CSI (Control Sequence Introducer) \x1B[ is the start of most ANSI commands.
 // Cursor Control: setCursor(row, col) uses the H command to position the cursor anywhere on screen. This is crucial for building our game world.
 // Color System: We're using 4-bit colors (the original 16-color terminal palette). Each color has a foreground (31m for red) and background variant (41m for red background).
